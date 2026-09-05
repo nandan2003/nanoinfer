@@ -1,0 +1,21 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Large Model Weights (exceeds GitHub 100MB limit)
+models/*.gguf
+*.gguf
+*.bin
+
+# OS & Editor files
+.DS_Store
+.vscode/
+.idea/
+*.swp
