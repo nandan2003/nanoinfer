@@ -1,3 +1,4 @@
+import time
 import asyncio
 import json
 from typing import Optional
@@ -6,14 +7,14 @@ from server.inference import InferenceEngine
 from server.cache import PrefixTrieCache
 
 class HTTPServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8080, model_path: str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf"):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8080, model_path: str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf", pin_cores: bool = True):
         self.host = host
         self.port = port
 
         self.engine = InferenceEngine(model_path=model_path, n_ctx=512, verbose=False)
         self.cache = PrefixTrieCache(max_nodes=500)
         self.queue = RingBufferQueue(capacity=32)
-        self.pool = WorkerPool(num_workers=2, queue=self.queue, engine=self.engine, cache=self.cache)
+        self.pool = WorkerPool(num_workers=2, queue=self.queue, engine=self.engine, cache=self.cache, pin_cores=pin_cores)
 
         self.server: Optional[asyncio.Server] = None
 
@@ -66,6 +67,9 @@ class HTTPServer:
                 loop=loop,
             )
 
+            t_start = time.perf_counter()
+            token_timestamps = []
+
             if not self.queue.put(req, block=False):
                 resp_429 = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"error\": \"Server is busy\"}"
                 writer.write(resp_429)
@@ -85,13 +89,41 @@ class HTTPServer:
 
             while True:
                 token = await output_queue.get()
+                t_now = time.perf_counter()
                 if token is None:
                     break
 
+                token_timestamps.append(t_now)
                 chunk = json.dumps({"choices": [{"delta": {"content": token}}]})
                 writer.write(f"data: {chunk}\n\n".encode("utf-8"))
                 await writer.drain()
 
+            t_end = time.perf_counter()
+            e2e_sec = round(t_end - t_start, 4)
+            token_count = len(token_timestamps)
+
+            if token_count > 0:
+                ttft_ms = round((token_timestamps[0] - t_start) * 1000, 2)
+                if token_count > 1:
+                    decode_duration = token_timestamps[-1] - token_timestamps[0]
+                    itl_mean_ms = round((decode_duration / (token_count - 1)) * 1000, 2)
+                    tps = round((token_count - 1) / decode_duration, 2) if decode_duration > 0 else 0.0
+                else:
+                    itl_mean_ms = 0.0
+                    tps = 0.0
+            else:
+                ttft_ms = 0.0
+                itl_mean_ms = 0.0
+                tps = 0.0
+
+            telemetry_payload = json.dumps({
+                "ttft_ms": ttft_ms,
+                "itl_mean_ms": itl_mean_ms,
+                "tps": tps,
+                "e2e_sec": e2e_sec,
+                "token_count": token_count,
+            })
+            writer.write(f"event: telemetry\ndata: {telemetry_payload}\n\n".encode("utf-8"))
             writer.write(b"data: [DONE]\n\n")
             await writer.drain()
 

@@ -45,7 +45,9 @@ class TestSDKIntegration(unittest.TestCase):
 
         full_reply = "".join(tokens)
         self.assertGreater(len(tokens), 0)
+        self.assertIsNotNone(self.client.last_telemetry)
         print(f"\n[PASS] client.chat_stream() yielded {len(tokens)} tokens: '{full_reply.strip()}'")
+        print(f"[PASS] Telemetry -> TTFT: {self.client.last_telemetry.ttft_ms} ms | TPS: {self.client.last_telemetry.tps}")
 
 if __name__ == "__main__":
     unittest.main()

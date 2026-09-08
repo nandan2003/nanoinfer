@@ -1,3 +1,3 @@
-from .client import NanoInferClient
+from .client import NanoInferClient, Telemetry
 
-__all__ = ["NanoInferClient"]
+__all__ = ["NanoInferClient", "Telemetry"]
