@@ -1,3 +1,4 @@
+import os
 import threading
 from typing import Optional, Any
 from dataclasses import dataclass
@@ -71,41 +72,62 @@ class WorkerPool:
     Pulls requests from the RingBufferQueue, checks the Prefix Trie Cache,
     runs CPU inference, and streams tokens back to the async event loop.
     """
-    def __init__(self, num_workers: int, queue: RingBufferQueue, engine: Any, cache: Any):
+    def __init__(self, num_workers: int, queue: RingBufferQueue, engine: Any, cache: Any, pin_cores: bool = True):
         self.num_workers = num_workers
         self.queue = queue
         self.engine = engine
         self.cache = cache
+        self.pin_cores = pin_cores
         self.threads: list[threading.Thread] = []
         self.running = True
+
+        # 1. Discover available cores on Linux, fallback to range(os.cpu_count() or 1)
+        if hasattr(os, "sched_getaffinity"):
+            self.available_cores = sorted(os.sched_getaffinity(0))
+        else:
+            self.available_cores = list(range(os.cpu_count() or 1))
+
+        # 2. An empty dictionary to store worker_id -> core mapping
+        self.worker_cores: dict[int, int] = {}
+        self.engine_lock = threading.Lock()
 
     def start(self) -> None:
         """Spawns the worker threads in daemon mode."""
         for i in range(self.num_workers):
-            t = threading.Thread(target=self._worker_loop, daemon=True, name=f"Worker-{i}")
+            t = threading.Thread(target=self._worker_loop, args=(i,), daemon=True, name=f"Worker-{i}")
             t.start()
             self.threads.append(t)
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, worker_id: int) -> None:
+        assigned_core = self.available_cores[worker_id % len(self.available_cores)]
+        self.worker_cores[worker_id] = assigned_core
+
+        if self.pin_cores and hasattr(os, "sched_setaffinity"):
+            try:
+                os.sched_setaffinity(0, {assigned_core})
+            except OSError:
+                pass
+
         while self.running:
             item = self.queue.get(timeout=1.0)
             if item is None:
                 continue
 
             try:
-                tokens = self.engine.tokenize(item.prompt)
+                with self.engine_lock:
+                    tokens = self.engine.tokenize(item.prompt)
 
-                matched_node, matched_len = self.cache.match_longest_prefix(tokens)
-                if matched_node is not None and matched_node.state is not None:
-                    self.engine.load_state(matched_node.state)
-                else:
-                    self.engine.reset()
+                    matched_node, matched_len = self.cache.match_longest_prefix(tokens)
+                    if matched_node is not None and matched_node.state is not None:
+                        self.engine.load_state(matched_node.state)
+                    else:
+                        self.engine.reset()
 
-                for token in self.engine.generate(item.prompt, max_tokens=item.max_tokens, temperature=item.temperature):
-                    item.loop.call_soon_threadsafe(item.output_queue.put_nowait, token)
+                    for token in self.engine.generate(item.prompt, max_tokens=item.max_tokens, temperature=item.temperature):
+                        item.loop.call_soon_threadsafe(item.output_queue.put_nowait, token)
 
-                new_state = self.engine.save_state()
-                self.cache.insert(tokens, new_state)
+                    new_state = self.engine.save_state()
+                    self.cache.insert(tokens, new_state)
 
             except Exception as e:
                 item.loop.call_soon_threadsafe(item.output_queue.put_nowait, f"[Error: {e}]")

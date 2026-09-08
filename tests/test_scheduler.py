@@ -1,3 +1,4 @@
+import os
 import unittest
 import asyncio
 from server.inference import InferenceEngine
@@ -18,6 +19,16 @@ class TestSchedulerIntegration(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.pool.stop()
+
+    def test_worker_cpu_affinity(self):
+        if not hasattr(os, "sched_getaffinity"):
+            self.skipTest("os.sched_getaffinity not supported on this platform")
+
+        for i, thread in enumerate(self.pool.threads):
+            expected_core = self.pool.worker_cores[i]
+            actual_mask = os.sched_getaffinity(thread.native_id)
+            self.assertEqual(actual_mask, {expected_core})
+            print(f"\n[PASS] Worker-{i} pinned to CPU core {expected_core} (affinity: {actual_mask})")
 
     def test_worker_end_to_end_streaming(self):
         async def run_request():
