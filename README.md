@@ -51,7 +51,10 @@ Single APU core sequentially dequantizing 390 MB of Q4 blocks without multi-core
 ### Performance Analysis & Hardware Physics:
 * **Prefill scales with prompt length:** Prompt ingestion is dense matrix multiplication (GEMM). Arithmetic intensity exceeds the DDR4 ridge point (20 FLOPs/byte), saturating CPU SIMD execution units.
 * **Multi-core decode is memory-bandwidth bound (26 ms / token, ~38 tok/s):** Autoregressive token generation is memory-bandwidth bound (GEMV). Every generated token sweeps all model weights (390 MB) through memory. At dual-channel DDR4 bandwidth (~15.6 GB/s), $390\text{ MB} / 15.6\text{ GB/s} \approx 25\text{ ms}$ per token (~38-40 tok/s).
-* **Single-core pinning bottleneck (3050 ms / token, 0.33 tok/s):** Pinning a worker thread via `os.sched_setaffinity` isolates execution to 1 physical core, restricting OpenMP to that single core. A single 15W Zen 2 core cannot dequantize 390 MB of Q4 weights fast enough to saturate memory channels, shifting the bottleneck from memory bandwidth to single-thread compute.
+* **Single-core pinning bottleneck (3050 ms / token, 0.33 tok/s):**
+  - *Napkin math check:* At a conservative single-channel DDR4 streaming speed of ~5 GB/s, reading 390 MB takes $\approx 78\text{ ms}$. Why does single-core pinned decode report 3050 ms?
+  - *Profiled root cause:* When `os.sched_setaffinity` confines the worker thread to a single core, `llama.cpp`'s default OpenMP thread pool (4–6 threads) inherits that single-core mask. The threads aggressively oversubscribe the single physical core, spending most cycles spin-locking on OpenMP reduction barriers and context-switching.
+  - Constraining OpenMP to a single thread (`n_threads=1`) immediately cuts decode latency by >2.3×, with the remainder bounded by single-core AVX2 unpacking/dequantization of Q4_K_M blocks rather than bus bandwidth.
 * **Prefix Trie cache hit speedup:** When a prompt shares a prefix with an earlier request, TTFT drops from ~200-300 ms to < 2 ms (time to restore the KV snapshot).
 
 ---
@@ -60,7 +63,7 @@ Single APU core sequentially dequantizing 390 MB of Q4 blocks without multi-core
 
 * **Prefix Trie Cache (`server/cache.py`):** Token IDs form a trie, with nodes linked in an LRU doubly-linked list. Lookups are $O(K)$, evictions are $O(1)$. Leaves store `llama.cpp` KV snapshots.
 * **Ring Buffer Queue (`server/scheduler.py`):** Pre-allocated circular array `[None] * capacity`. Synchronized with `threading.Lock` and two `threading.Condition` variables (`not_empty`, `not_full`). No heap allocations during request handling. Drops requests with 429 when saturated.
-* **CPU Core Pinning (`server/scheduler.py`):** Uses `os.sched_setaffinity` to lock worker threads to dedicated physical cores. Prevents the OS scheduler from bouncing threads between cores and trashing L1/L2 caches.
+* **CPU Core Pinning (`server/scheduler.py`):** Uses `os.sched_setaffinity` to pin worker threads to dedicated physical cores. While model compute is serialized behind `engine_lock` in v1, pinning guarantees that when a worker thread resumes execution, it stays on its designated core, eliminating OS scheduler core migration and L1/L2 cache invalidation.
 * **Raw Async Sockets (`server/http_server.py`):** `asyncio.start_server` with manual HTTP/1.1 header parsing and chunked SSE streaming. No web framework dependencies.
 * **Trailing Telemetry:** Emits an `event: telemetry` SSE frame right before `data: [DONE]`. Gives TTFT, ITL, TPS, and latency without extra polling.
 
@@ -68,7 +71,7 @@ Single APU core sequentially dequantizing 390 MB of Q4 blocks without multi-core
 
 ## Known Limitations & Trade-offs
 
-* **Single-context serialization:** Workers share one `llama_context`. Model calls are serialized behind an engine lock. To scale throughput across cores, each worker needs its own context handle.
+* **Single-context serialization:** Workers share one `llama_context` protected by `engine_lock`. Request queuing (`RingBufferQueue`) and socket streaming are asynchronous and concurrent, but model compute is serialized behind the mutex. To achieve concurrent parallel inference across cores, v2 requires per-worker context instances (`llama_new_context_with_model`) or continuous batching.
 * **KV snapshot memory:** Storing full `save_state()` snapshots takes 5–10 MB per entry. At 500 entries, that's ~3–5 GB of RAM. A production engine needs block-based paged memory (PagedAttention) instead of monolithic snapshots.
 * **Trie orphan leak:** Pruning an intermediate trie node unlinks it from its parent, but descendants stay in the LRU list until evicted. Needs reference-counted subtree eviction.
 
@@ -80,7 +83,7 @@ Single APU core sequentially dequantizing 390 MB of Q4 blocks without multi-core
 nanoinfer/
 ├── .github/
 │   └── workflows/
-│       └── ci.yml       # GitHub Actions CI matrix (Python 3.10, 3.11)
+│       └── ci.yml       # GitHub Actions CI pipeline (Python 3.11)
 ├── models/
 │   └── qwen2.5-0.5b-instruct-q4_k_m.gguf # Quantized model weights (390 MB)
 │
@@ -112,9 +115,10 @@ nanoinfer/
 ```bash
 # 1. Setup
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install --prefer-binary -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 
 # Download model weights (Qwen 2.5 0.5B Instruct Q4_K_M ~390 MB)
+# Compatible with standard GGUF architectures (Qwen, Llama 3, Phi-3)
 mkdir -p models
 curl -L -o models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
   https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
