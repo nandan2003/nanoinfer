@@ -18,7 +18,7 @@ Bounded Ring Buffer (server/scheduler.py)
   │  fixed array, mutex + condition variables, HTTP 429 when full
   ▼
 Pinned Worker Pool (server/scheduler.py)
-  │  workers pinned to physical cores via os.sched_setaffinity
+  │  workers pinned via os.sched_setaffinity (serialized via engine_lock)
   ├──▶ Prefix Trie Cache (server/cache.py): O(K) lookup, O(1) LRU eviction
   └──▶ llama.cpp Engine (server/inference.py): streaming tokens + KV snapshots
 ```
