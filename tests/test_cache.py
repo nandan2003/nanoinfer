@@ -41,6 +41,18 @@ class TestPrefixTrieCache(unittest.TestCase):
         self.assertIsNotNone(node)
         print("\n[PASS] O(1) LRU Eviction successfully pruned oldest node")
 
+    def test_04_subtree_pruning_on_eviction(self):
+        cache = PrefixTrieCache(max_nodes=4)
+        cache.insert([1, 2, 3], state="STATE_123")
+        cache.insert([1, 2, 3, 4], state="STATE_1234")
+        self.assertEqual(cache.size, 4)
+
+        cache.insert([5], state="STATE_5")
+        self.assertLessEqual(cache.size, cache.max_nodes)
+        node, _ = cache.match_longest_prefix([1])
+        self.assertIsNone(node)
+        print("\n[PASS] Subtree pruning cleanly unlinked descendant nodes upon eviction")
+
 if __name__ == "__main__":
     unittest.main()
 

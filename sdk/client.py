@@ -79,3 +79,13 @@ class NanoInferClient:
         """
         return "".join(self.chat_stream(prompt, max_tokens=max_tokens, temperature=temperature))
 
+    def list_models(self) -> list[str]:
+        """
+        Queries /v1/models and returns the list of model IDs available on the server.
+        """
+        url = f"{self.base_url}/v1/models"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return [m["id"] for m in data.get("data", [])]
+

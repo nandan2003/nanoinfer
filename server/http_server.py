@@ -1,3 +1,4 @@
+import os
 import time
 import asyncio
 import json
@@ -7,14 +8,22 @@ from server.inference import InferenceEngine
 from server.cache import PrefixTrieCache
 
 class HTTPServer:
-    def __init__(self, host: str = "127.0.0.1", port: int = 8080, model_path: str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf", pin_cores: bool = True):
+    def __init__(self, host: str = "127.0.0.1", port: int = 8080, model_path: str = "models/qwen2.5-0.5b-instruct-q4_k_m.gguf", pin_cores: bool = True, num_workers: int = 2, parallel_engines: bool = False):
         self.host = host
         self.port = port
+        self.model_path = model_path
+        self.model_name = os.path.basename(model_path).replace(".gguf", "")
 
-        self.engine = InferenceEngine(model_path=model_path, n_ctx=512, verbose=False)
+        threads_per_engine = 1 if pin_cores else None
+        if parallel_engines and num_workers > 1:
+            engines = [InferenceEngine(model_path=model_path, n_ctx=512, n_threads=threads_per_engine, verbose=False) for _ in range(num_workers)]
+        else:
+            engines = InferenceEngine(model_path=model_path, n_ctx=512, n_threads=threads_per_engine, verbose=False)
+
+        self.engine = engines if not isinstance(engines, list) else engines[0]
         self.cache = PrefixTrieCache(max_nodes=500)
         self.queue = RingBufferQueue(capacity=32)
-        self.pool = WorkerPool(num_workers=2, queue=self.queue, engine=self.engine, cache=self.cache, pin_cores=pin_cores)
+        self.pool = WorkerPool(num_workers=num_workers, queue=self.queue, engine=engines, cache=self.cache, pin_cores=pin_cores)
 
         self.server: Optional[asyncio.Server] = None
 
@@ -43,8 +52,37 @@ class HTTPServer:
                     key, val = header_str.split(":", 1)
                     headers[key.strip().lower()] = val.strip()
 
+            if method == "GET" and path == "/v1/models":
+                models_payload = json.dumps({
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": self.model_name,
+                            "object": "model",
+                            "created": int(time.time()),
+                            "owned_by": "nanoinfer"
+                        }
+                    ]
+                }).encode("utf-8")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(models_payload)}\r\n\r\n".encode("utf-8")
+                    + models_payload
+                )
+                await writer.drain()
+                writer.close()
+                return
+
             if method != "POST" or path != "/v1/chat/completions":
-                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\n404 Not Found")
+                err_body = json.dumps({
+                    "error": {
+                        "message": f"Invalid endpoint or method: {method} {path}",
+                        "type": "invalid_request_error",
+                        "code": 404
+                    }
+                }).encode("utf-8")
+                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n" + f"Content-Length: {len(err_body)}\r\n\r\n".encode("utf-8") + err_body)
                 await writer.drain()
                 writer.close()
                 return
@@ -71,8 +109,14 @@ class HTTPServer:
             token_timestamps = []
 
             if not self.queue.put(req, block=False):
-                resp_429 = b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 30\r\n\r\n{\"error\": \"Server is busy\"}"
-                writer.write(resp_429)
+                err_429 = json.dumps({
+                    "error": {
+                        "message": "Server queue is full, request rate limit exceeded",
+                        "type": "rate_limit_error",
+                        "code": 429
+                    }
+                }).encode("utf-8")
+                writer.write(b"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\n" + f"Content-Length: {len(err_429)}\r\n\r\n".encode("utf-8") + err_429)
                 await writer.drain()
                 writer.close()
                 return

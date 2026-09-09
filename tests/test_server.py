@@ -86,6 +86,42 @@ class TestHTTPServer(unittest.TestCase):
 
         asyncio.run(run_client())
 
+    def test_02_http_models_endpoint(self):
+        models_port = TEST_PORT + 1
+        server = HTTPServer(host="127.0.0.1", port=models_port)
+
+        async def run_client():
+            await server.start()
+            await asyncio.sleep(0.5)
+
+            try:
+                reader, writer = await asyncio.open_connection("127.0.0.1", models_port)
+                request = f"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{models_port}\r\n\r\n"
+                writer.write(request.encode("utf-8"))
+                await writer.drain()
+
+                status_line = await reader.readline()
+                self.assertIn(b"200 OK", status_line)
+
+                while True:
+                    line = await reader.readline()
+                    if line in (b"\r\n", b"\n", b""):
+                        break
+
+                body = await reader.read(1024)
+                data = json.loads(body.decode("utf-8"))
+                self.assertEqual(data.get("object"), "list")
+                self.assertTrue(len(data.get("data", [])) > 0)
+                print(f"[PASS] GET /v1/models returned: {data['data'][0]['id']}")
+
+                writer.close()
+                await writer.wait_closed()
+
+            finally:
+                await server.stop()
+
+        asyncio.run(run_client())
+
 if __name__ == "__main__":
     unittest.main()
 

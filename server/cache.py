@@ -40,18 +40,33 @@ class PrefixTrieCache:
         self._remove_node(node)
         self._add_to_head(node)
 
+    def _prune_subtree(self, node: TrieNode) -> int:
+        """Recursively unlinks all descendant nodes from Trie and LRU list."""
+        pruned = 0
+        for child in list(node.children.values()):
+            pruned += self._prune_subtree(child)
+            self._remove_node(child)
+            child.state = None
+            child.parent = None
+            pruned += 1
+        node.children.clear()
+        return pruned
+
     def _evict_lru(self) -> None:
-        """Evicts the Least Recently Used node (right before dummy tail) in O(1)."""
+        """Evicts the Least Recently Used node and unlinks any orphaned descendants."""
         if self.tail.prev == self.head:
             return  
 
         lru_node = self.tail.prev
         self._remove_node(lru_node)
 
+        pruned_count = self._prune_subtree(lru_node)
+        lru_node.state = None
+
         if lru_node.parent and lru_node.token_id in lru_node.parent.children:
             del lru_node.parent.children[lru_node.token_id]
 
-        self.size -= 1
+        self.size -= (1 + pruned_count)
 
     def match_longest_prefix(self, tokens: list[int]) -> tuple[Optional[TrieNode], int]:
         """

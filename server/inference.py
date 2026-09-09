@@ -2,10 +2,11 @@ from typing import Iterator, Any
 from llama_cpp import Llama
 
 class InferenceEngine:
-    def __init__(self, model_path: str, n_ctx: int = 512, verbose: bool = False):
+    def __init__(self, model_path: str, n_ctx: int = 512, n_threads: int | None = None, verbose: bool = False):
         self.llm = Llama(
             model_path=model_path,
             n_ctx=n_ctx,
+            n_threads=n_threads,
             verbose=verbose,
         )
 

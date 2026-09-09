@@ -87,9 +87,15 @@ class WorkerPool:
         else:
             self.available_cores = list(range(os.cpu_count() or 1))
 
-        # 2. An empty dictionary to store worker_id -> core mapping
+        # 2. Support either a single shared engine or a pool of per-worker engines
+        if isinstance(engine, (list, tuple)):
+            self.engines = list(engine)
+        else:
+            self.engines = [engine]
+
         self.worker_cores: dict[int, int] = {}
-        self.engine_lock = threading.Lock()
+        self.engine_locks = [threading.Lock() for _ in range(len(self.engines))]
+        self.cache_lock = threading.Lock()
 
     def start(self) -> None:
         """Spawns the worker threads in daemon mode."""
@@ -108,26 +114,34 @@ class WorkerPool:
             except OSError:
                 pass
 
+        engine_idx = worker_id % len(self.engines)
+        engine = self.engines[engine_idx]
+        engine_lock = self.engine_locks[engine_idx]
+
         while self.running:
             item = self.queue.get(timeout=1.0)
             if item is None:
                 continue
 
             try:
-                with self.engine_lock:
-                    tokens = self.engine.tokenize(item.prompt)
+                with engine_lock:
+                    tokens = engine.tokenize(item.prompt)
 
-                    matched_node, matched_len = self.cache.match_longest_prefix(tokens)
-                    if matched_node is not None and matched_node.state is not None:
-                        self.engine.load_state(matched_node.state)
+                    with self.cache_lock:
+                        matched_node, matched_len = self.cache.match_longest_prefix(tokens)
+                        cached_state = matched_node.state if (matched_node and matched_node.state is not None) else None
+
+                    if cached_state is not None:
+                        engine.load_state(cached_state)
                     else:
-                        self.engine.reset()
+                        engine.reset()
 
-                    for token in self.engine.generate(item.prompt, max_tokens=item.max_tokens, temperature=item.temperature):
+                    for token in engine.generate(item.prompt, max_tokens=item.max_tokens, temperature=item.temperature):
                         item.loop.call_soon_threadsafe(item.output_queue.put_nowait, token)
 
-                    new_state = self.engine.save_state()
-                    self.cache.insert(tokens, new_state)
+                    new_state = engine.save_state()
+                    with self.cache_lock:
+                        self.cache.insert(tokens, new_state)
 
             except Exception as e:
                 item.loop.call_soon_threadsafe(item.output_queue.put_nowait, f"[Error: {e}]")

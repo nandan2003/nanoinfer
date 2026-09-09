@@ -49,6 +49,12 @@ class TestSDKIntegration(unittest.TestCase):
         print(f"\n[PASS] client.chat_stream() yielded {len(tokens)} tokens: '{full_reply.strip()}'")
         print(f"[PASS] Telemetry -> TTFT: {self.client.last_telemetry.ttft_ms} ms | TPS: {self.client.last_telemetry.tps}")
 
+    def test_03_sdk_list_models(self):
+        models = self.client.list_models()
+        self.assertIsInstance(models, list)
+        self.assertIn("qwen2.5-0.5b-instruct-q4_k_m", models)
+        print(f"\n[PASS] client.list_models() returned: {models}")
+
 if __name__ == "__main__":
     unittest.main()
 

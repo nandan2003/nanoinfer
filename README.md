@@ -61,19 +61,18 @@ Single APU core sequentially dequantizing 390 MB of Q4 blocks without multi-core
 
 ## Design Choices
 
-* **Prefix Trie Cache (`server/cache.py`):** Token IDs form a trie, with nodes linked in an LRU doubly-linked list. Lookups are $O(K)$, evictions are $O(1)$. Leaves store `llama.cpp` KV snapshots.
+* **Prefix Trie Cache (`server/cache.py`):** Token IDs form a trie, with nodes linked in an LRU doubly-linked list. Lookups are $O(K)$, evictions are $O(1)$. Leaves store `llama.cpp` KV snapshots, with recursive subtree unlinking on eviction.
 * **Ring Buffer Queue (`server/scheduler.py`):** Pre-allocated circular array `[None] * capacity`. Synchronized with `threading.Lock` and two `threading.Condition` variables (`not_empty`, `not_full`). No heap allocations during request handling. Drops requests with 429 when saturated.
-* **CPU Core Pinning (`server/scheduler.py`):** Uses `os.sched_setaffinity` to pin worker threads to dedicated physical cores. While model compute is serialized behind `engine_lock` in v1, pinning guarantees that when a worker thread resumes execution, it stays on its designated core, eliminating OS scheduler core migration and L1/L2 cache invalidation.
-* **Raw Async Sockets (`server/http_server.py`):** `asyncio.start_server` with manual HTTP/1.1 header parsing and chunked SSE streaming. No web framework dependencies.
+* **Multi-Worker Core Pinning (`server/scheduler.py`):** Uses `os.sched_setaffinity` to pin worker threads to dedicated physical cores. Supports both single-engine and multi-engine pools, with per-worker locking that frees token generation from contention.
+* **Raw Async Sockets (`server/http_server.py`):** `asyncio.start_server` with manual HTTP/1.1 header parsing and chunked SSE streaming. Supports `/v1/chat/completions` and `/v1/models`. No web framework dependencies.
 * **Trailing Telemetry:** Emits an `event: telemetry` SSE frame right before `data: [DONE]`. Gives TTFT, ITL, TPS, and latency without extra polling.
 
 ---
 
 ## Known Limitations & Trade-offs
 
-* **Single-context serialization:** Workers share one `llama_context` protected by `engine_lock`. Request queuing (`RingBufferQueue`) and socket streaming are asynchronous and concurrent, but model compute is serialized behind the mutex. To achieve concurrent parallel inference across cores, v2 requires per-worker context instances (`llama_new_context_with_model`) or continuous batching.
 * **KV snapshot memory:** Storing full `save_state()` snapshots takes 5–10 MB per entry. At 500 entries, that's ~3–5 GB of RAM. A production engine needs block-based paged memory (PagedAttention) instead of monolithic snapshots.
-* **Trie orphan leak:** Pruning an intermediate trie node unlinks it from its parent, but descendants stay in the LRU list until evicted. Needs reference-counted subtree eviction.
+* **Continuous Batching:** Requests are dispatched worker-by-worker. To maximize throughput on high-core server CPUs (e.g. dual Xeon/EPYC), v2 requires continuous batching to share weight sweeps across concurrent requests.
 
 ---
 
@@ -103,7 +102,7 @@ nanoinfer/
 │   ├── quantize.py      # INT8 symmetric quantization error
 │   └── telemetry_suite.py # TTFT/ITL benchmark suite (multicore & pinned)
 │
-├── tests/               # 14 unit tests (cache, queue, scheduler, server, sdk)
+├── tests/               # 17 unit tests (cache, subtree pruning, queue, scheduler, server, sdk)
 ├── LICENSE              # MIT License
 └── requirements.txt     # llama-cpp-python, numpy
 ```
@@ -123,7 +122,7 @@ mkdir -p models
 curl -L -o models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
   https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
 
-# 2. Run unit tests (14 tests)
+# 2. Run unit tests (17 tests)
 python -m unittest discover -s tests -v
 
 # 3. Run benchmarks
